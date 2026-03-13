@@ -42,14 +42,21 @@ In this repo, we study World Models not as a single architecture, but as a syste
 
 ```
 Causal-Dynamical-AI/
-├── 01_Calculus_and_Dynamics/       # Phase 0: The Physics of State
-│   ├── Ch02_Flows_on_the_Line/     # Theory: Fixed Points & Potentials
-│   │   ├── README.md               # My notes & AGI relevancy
-│   │   ├── derivations.md          # Hand-written LaTeX derivations
-│   │   └── src/                    # Manual Euler/RK4 solvers
-├── notebooks/                      # Integrated "Theory-to-Code" Jupyters
-├── experiments/                    # Benchmarking SSMs vs Transformers
-└── src/                            # Reusable Causal & Dynamical modules
+├── 01_Calculus_and_Dynamics/
+│   ├── Ch02_Flows_on_the_Line/
+│   │   ├── Ch02_Flows_on_the_Line.ipynb  # Intro + Theory + Relevance + Code + Viz
+│   │   └── derivations.md                # Heavy LaTeX: Manual ODE solving, Taylor proofs
+│   ├── Ch03_Bifurcations/
+│   │   ├── Ch03_Bifurcations.ipynb
+│   │   └── derivations.md
+│   └── ...
+├── 02_Probabilistic_Graphs/
+│   ├── Ch03_Bayesian_Networks/
+│   │   ├── Ch03_Bayesian_Networks.ipynb
+│   │   └── derivations.md
+├── src/                                  # Reusable core modules (pgm_utils.py, etc.)
+├── experiments/                          # Large-scale benchmarks (e.g., Mamba vs Transformer)
+└── README.md
 ```
 
 ---
