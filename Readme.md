@@ -96,6 +96,10 @@ jupyter lab notebooks/phase_00_fixed_points.ipynb
 - **Visualizations:** Every notebook includes interactive plots. Dynamics are best understood through movement LOL!!
 
 ---
+## Resources used
+- Nonlinear Dynamics and Chaos (Strogatz)
+- Probabilistic Machine Learning (Kevin P. Murph)
+
 
 ## Contributing & Chat
 
