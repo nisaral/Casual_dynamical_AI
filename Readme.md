@@ -24,6 +24,24 @@ In this repo, we study World Models not as a single architecture, but as a syste
 
 ---
 
+## Prerequisites & Background
+
+This repo assumes you have a **high-level understanding of Machine Learning, Deep Learning, and Large Language Models (LLMs).** You don't need to be a math PhD, but you should be comfortable with how neural networks are trained (gradient descent, loss functions) and what problems standard Transformer-based LLMs face today.
+
+If you are new to the concept of **World Models**, **State Space Models**, or **Embodied AI**, here are some core concepts and papers to skim before diving in:
+
+- **World Models:** 
+  - Ha & Schmidhuber's [World Models (2018)](https://arxiv.org/abs/1803.10122)
+  - Yann LeCun's [A Path Towards Autonomous Machine Intelligence (JEPA)](https://openreview.net/forum?id=BZ5a1r-kVsf)
+- **State Space Models (SSMs):**
+  - Gu & Dao's [Mamba: Linear-Time Sequence Modeling with Selective State Spaces](https://arxiv.org/abs/2312.00752)
+  - AI21's [Jamba: A Hybrid Transformer-Mamba Language Model](https://arxiv.org/abs/2403.19887)
+- **Continuous/Dynamical Deep Learning:**
+  - Hasani et al.'s [Liquid Neural Networks (LNNs)](https://arxiv.org/abs/2006.04439)
+  - Chen et al.'s [Neural Ordinary Differential Equations (Neural ODEs)](https://arxiv.org/abs/1806.07366)
+
+---
+
 ## The Roadmap (Phase-by-Phase)
 
 | Phase | Focus | Key Concepts | Resources |
