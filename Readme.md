@@ -63,15 +63,17 @@ Causal-Dynamical-AI/
 ├── 01_Calculus_and_Dynamics/
 │   ├── Ch02_Flows_on_the_Line/
 │   │   ├── Ch02_Flows_on_the_Line.ipynb  # Intro + Theory + Relevance + Code + Viz
-│   │   └── derivations.md                # Heavy LaTeX: Manual ODE solving, Taylor proofs
+│   │   
 │   ├── Ch03_Bifurcations/
 │   │   ├── Ch03_Bifurcations.ipynb
-│   │   └── derivations.md
+│   │   
+│   ├── Phase_Plane/
+│   │   └── Phase_Plane.ipynb
 │   └── ...
 ├── 02_Probabilistic_Graphs/
 │   ├── Ch03_Bayesian_Networks/
 │   │   ├── Ch03_Bayesian_Networks.ipynb
-│   │   └── derivations.md
+│   │   
 ├── src/                                  # Reusable core modules (pgm_utils.py, etc.)
 ├── experiments/                          # Large-scale benchmarks (e.g., Mamba vs Transformer)
 └── README.md
