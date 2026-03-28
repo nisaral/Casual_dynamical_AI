@@ -69,6 +69,8 @@ Causal-Dynamical-AI/
 │   │   
 │   ├── Phase_Plane/
 │   │   └── Phase_Plane.ipynb
+│   ├── Ch07_Limit_Cycles/
+│   │   └── Ch07_Limit_Cycles.ipynb
 │   └── ...
 ├── 02_Probabilistic_Graphs/
 │   ├── Ch03_Bayesian_Networks/
