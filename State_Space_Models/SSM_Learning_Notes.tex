@@ -1,0 +1,942 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=0.9in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{tcolorbox}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{setspace}
+\onehalfspacing
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!60!black}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codeframe}{RGB}{210,210,210}
+\definecolor{notebg}{RGB}{245,248,252}
+\definecolor{warnbg}{RGB}{255,248,230}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  language=Python,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{orange!70!black}
+}
+
+\newtcolorbox{notebox}{
+  colback=notebg, colframe=blue!50!black,
+  boxrule=0.55pt, arc=2pt, left=6pt,right=6pt,top=4pt,bottom=4pt
+}
+\newtcolorbox{warnbox}{
+  colback=warnbg, colframe=orange!70!black,
+  boxrule=0.55pt, arc=2pt, left=6pt,right=6pt,top=4pt,bottom=4pt
+}
+
+\newcommand{\figpath}{figures/}
+\newcommand{\incfig}[2]{%
+  \begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\textwidth]{\figpath #1}
+  \caption{#2}
+  \end{figure}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small State-Space Models --- Expanded Study Notes}
+\rhead{\small Math $\cdot$ GPU $\cdot$ Papers $\cdot$ Industry}
+\cfoot{\thepage}
+
+\title{\textbf{State-Space Models: Expanded Study Notes}\\[0.4em]
+\large From Continuous Dynamics to S4, Mamba, GPUs, and Production Systems}
+\author{Aligned to \url{https://www.youtube.com/watch?v=A7iAmVr0QE4}\\[0.3em]
+Companion notebook: \texttt{SSM\_S4\_Mamba\_HiPPO.ipynb}\\
+Figures auto-generated in \texttt{State\_Space\_Models/figures/}}
+\date{August 2026 --- long-form edition ($\ge 25$ pages)}
+
+\begin{document}
+\maketitle
+
+\begin{notebox}
+\textbf{How to use this book-like note.}
+Read in order. Every equation is surrounded by explanation and, where useful, a derivation.
+Figures are not decoration: each one is explained in the caption and in the text above/below it.
+When you finish a part, you should be able to retell it without looking.
+\end{notebox}
+
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{The problem this whole field is trying to solve}
+%======================================================================
+
+\subsection{What sequence models must do}
+A sequence model sees a stream $u_0,u_1,\ldots,u_{L-1}$ (token embeddings, audio samples, DNA bases, image patches, \ldots) and must produce outputs $y_0,\ldots,y_{L-1}$ that depend on the \emph{right} parts of the past.
+Three pressures fight each other:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Quality} --- do not forget important information from far away.
+  \item \textbf{Compute} --- train on billions of tokens and serve users with low latency.
+  \item \textbf{Memory} --- fit activations, weights, and caches on a GPU.
+\end{enumerate}
+
+Transformers address quality with pairwise attention:
+\begin{equation}
+\mathrm{Attention}(Q,K,V)
+=\mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V.
+\label{eq:attn}
+\end{equation}
+Each position builds a query vector $Q$ (``what am I looking for?''), a key $K$ (``what do I contain?''), and a value $V$ (``what content do I pass if selected?'').
+The matrix $QK^\top$ has shape $L\times L$: every token scores every other token.
+Dividing by $\sqrt{d}$ keeps the scale of those scores from exploding as the channel dimension $d$ grows, so softmax does not collapse to a one-hot.
+The result is a rich, content-based routing of information.
+
+The cost is structural.
+Forming and multiplying through an $L\times L$ matrix is $\Theta(L^2)$ work (and naive memory).
+At generation time, implementations store past keys and values in a \textbf{KV-cache} so they are not recomputed; that cache still grows as $\Theta(L)$ \emph{per layer}, which becomes the bottleneck for long chats, long documents, and multi-thousand concurrent sessions.
+
+\begin{notebox}
+\textbf{Intuition.}
+Attention re-reads the entire room every time someone speaks.
+That is flexible, but the room gets expensive as more people walk in.
+\end{notebox}
+
+\incfig{fig07_complexity.png}{%
+\textbf{Figure: compute growth with sequence length.}
+Both curves are normalized to their value at $L=512$ so you can compare \emph{shapes}.
+Attention's $L^2$ curve climbs steeply on the log-log plot: doubling $L$ multiplies pairwise work by about four.
+An SSM scan that scales like $L\cdot N$ (state size $N$ fixed) climbs much more slowly.
+This is the core systems motivation for SSMs on long context: not that they are ``always better,'' but that their cost curve is a different animal.}
+
+RNNs and LSTMs already had fixed-size states and $O(1)$ update per token, but training is sequential along time, gradients vanish or explode over long horizons, and on large language workloads they historically lost to Transformers.
+State-space models keep the fixed-state idea, import continuous-time memory theory, then add structure and (later) selection so that training can be parallel and quality can approach attention on many tasks.
+
+\incfig{fig08_memory_growth.png}{%
+\textbf{Figure: decode memory, schematic.}
+We plot a rough FP16 estimate for a 32-layer, width-4096 model.
+Transformer KV-cache grows linearly with context length (two matrices $K,V$ per layer).
+An SSM recurrent state of size $N=16$ per channel is essentially \emph{flat} in $L$.
+Real systems differ by GQA/MQA, quantization, hybrid layers, etc., but the qualitative gap is why Mamba-style models advertise large serving wins on long contexts.}
+
+%======================================================================
+\section{Continuous-time SSMs --- full story and derivations}
+%======================================================================
+
+\subsection{The defining equations}
+
+A continuous linear state-space model is
+\begin{equation}
+\begin{aligned}
+\dot{x}(t) &= A\,x(t)+B\,u(t),\\
+y(t) &= C\,x(t)+D\,u(t).
+\end{aligned}
+\label{eq:cont}
+\end{equation}
+Here:
+\begin{itemize}[leftmargin=*]
+  \item $u(t)\in\mathbb{R}$ is the input (we start SISO; multi-channel later).
+  \item $x(t)\in\mathbb{R}^N$ is the \textbf{state} --- a fixed-size notebook of the past.
+  \item $y(t)\in\mathbb{R}$ is the output feature.
+  \item $A\in\mathbb{R}^{N\times N}$ is the free dynamics of the notebook (how it fades and mixes alone).
+  \item $B\in\mathbb{R}^{N\times 1}$ aims the pen that writes $u$ into the notebook.
+  \item $C\in\mathbb{R}^{1\times N}$ reads a linear combination of slots into $y$.
+  \item $D\in\mathbb{R}$ is feedthrough: a direct skip from input to output (residual-like).
+\end{itemize}
+
+\paragraph{Line 1 in words.}
+The rate of change of memory equals ``what memory does by itself'' plus ``what the new input writes.''
+
+\paragraph{Line 2 in words.}
+The output is a readout of memory, optionally plus a peek at the raw input.
+
+\subsection{Homogeneous solution and the matrix exponential}
+
+If $u\equiv 0$, then $\dot{x}=Ax$.
+The solution is $x(t)=e^{At}x(0)$, where the matrix exponential is defined by the power series
+\begin{equation}
+e^{At}=\sum_{k=0}^{\infty}\frac{(At)^k}{k!},
+\end{equation}
+which always converges.
+If $A$ is diagonalizable, $A=V\Lambda V^{-1}$ with $\Lambda=\mathrm{diag}(\lambda_1,\ldots,\lambda_N)$, then
+\begin{equation}
+e^{At}=V\,\mathrm{diag}\big(e^{\lambda_1 t},\ldots,e^{\lambda_N t}\big)\,V^{-1}.
+\end{equation}
+Each eigenmode multiplies by $e^{\lambda_i t}$:
+\begin{itemize}[leftmargin=*]
+  \item $\mathrm{Re}(\lambda_i)<0$: stable decay (forgetting);
+  \item $\mathrm{Re}(\lambda_i)\approx 0$: long-lived memory;
+  \item $\mathrm{Im}(\lambda_i)\neq 0$: oscillation / ringing;
+  \item $\mathrm{Re}(\lambda_i)>0$: explosion (usually disastrous inside a network).
+\end{itemize}
+For a real pole $\lambda=-a$ with $a>0$, the continuous time-constant is $1/a$: after time $t=1/a$ the mode has dropped by factor $e^{-1}$.
+
+\incfig{fig01_impulse_response.png}{%
+\textbf{Figure: real poles and forgetting speed.}
+For the scalar system $\dot x=\lambda x+u$, $y=x$ with $\lambda<0$, the impulse response is simply $k(t)=e^{\lambda t}$ for $t\ge 0$.
+More negative $\lambda$ means the spike is forgotten faster.
+When you stack many modes (next sections), the full kernel is a mixture of such curves --- that is multi-scale memory.}
+
+\incfig{fig02_oscillatory_kernel.png}{%
+\textbf{Figure: complex poles.}
+If eigenvalues come in complex conjugate pairs $\alpha\pm i\omega$ with $\alpha<0$, the impulse response rings: $e^{\alpha t}\cos(\omega t+\phi)$.
+This can represent periodic structure in signals (audio, seasons, rhythmic patterns).
+In language models one often constrains poles to be real-negative for stability simplicity, but the general theory allows oscillation.}
+
+\subsection{Forced solution --- variation of parameters (full derivation)}
+
+We solve $\dot{x}=Ax+Bu$ with $x(0)=x_0$.
+
+\textbf{Step 1.} Seek $x(t)=e^{At}v(t)$ (homogeneous solution shape with varying coefficient).
+
+\textbf{Step 2.} Differentiate:
+\begin{equation}
+\dot{x}=A e^{At}v+e^{At}\dot{v}.
+\end{equation}
+Set equal to $Ax+Bu=A e^{At}v+Bu$:
+\begin{equation}
+e^{At}\dot{v}=Bu
+\quad\Rightarrow\quad
+\dot{v}=e^{-At}Bu.
+\end{equation}
+
+\textbf{Step 3.} Integrate from $0$ to $t$:
+\begin{equation}
+v(t)=v(0)+\int_0^t e^{-A\tau}B\,u(\tau)\,d\tau.
+\end{equation}
+But $x(0)=e^{0}v(0)=v(0)=x_0$, so
+\begin{equation}
+x(t)=e^{At}x_0+\int_0^t e^{A(t-\tau)}B\,u(\tau)\,d\tau.
+\label{eq:varpar}
+\end{equation}
+
+\textbf{Words for \eqref{eq:varpar}.}
+Fade the initial notebook for time $t$.
+Then, for every past moment $\tau$, take the write $Bu(\tau)$ and fade it by the elapsed time $t-\tau$; add all those faded writes together.
+
+\subsection{Output as convolution}
+
+Set $x_0=0$ and ignore $D$ for the pure SSM path:
+\begin{equation}
+y(t)=\int_0^t C e^{A(t-\tau)}B\,u(\tau)\,d\tau=(k*u)(t),
+\end{equation}
+with causal impulse response
+\begin{equation}
+k(t)=
+\begin{cases}
+C e^{At}B & t\ge 0,\\
+0 & t<0.
+\end{cases}
+\label{eq:kernel-c}
+\end{equation}
+So an LTI SSM is completely characterized by $k$: poke the system once at time 0; $k(t)$ is what you still see at lag $t$.
+
+\paragraph{Transfer function.}
+Taking Laplace transforms, $Y(s)=G(s)U(s)$ with
+\begin{equation}
+G(s)=C(sI-A)^{-1}B+D.
+\end{equation}
+Poles of $G$ are eigenvalues of $A$. Designing memory timescales \emph{is} placing those poles.
+
+%======================================================================
+\section{Discretization --- from continuous time to tokens}
+%======================================================================
+
+Language and most deep-learning pipelines are discrete: indices $k=0,1,2,\ldots$.
+We choose a positive stepsize $\Delta$ meaning ``how much continuous time one token is worth,'' and we want
+\begin{equation}
+x_k=\bar{A}x_{k-1}+\bar{B}u_k,\qquad
+y_k=\bar{C}x_k+\bar{D}u_k.
+\label{eq:disc}
+\end{equation}
+
+\subsection{Zero-order hold (exact under a staircase input)}
+
+Assume $u(t)$ is constant on each interval $[k\Delta,(k+1)\Delta)$ and equal to $u_k$.
+Integrate \eqref{eq:varpar} over one step with constant $u$:
+\begin{equation}
+x\big((k+1)\Delta\big)
+=e^{A\Delta}x(k\Delta)
++\Big(\int_0^{\Delta}e^{A\tau}\,d\tau\Big)B\,u_k.
+\end{equation}
+Hence
+\begin{equation}
+\bar{A}=e^{A\Delta},\qquad
+\bar{B}=\Big(\int_0^{\Delta}e^{A\tau}\,d\tau\Big)B.
+\label{eq:zoh}
+\end{equation}
+If $A$ is invertible,
+\begin{equation}
+\int_0^{\Delta}e^{A\tau}\,d\tau=A^{-1}(e^{A\Delta}-I),
+\end{equation}
+so $\bar{B}=A^{-1}(e^{A\Delta}-I)B$.
+
+\paragraph{Scalar worked example.}
+Let $N=1$, $A=-a$ ($a>0$), $B=1$, $C=1$, $D=0$.
+Then
+\begin{equation}
+\bar{A}=e^{-a\Delta},\qquad
+\bar{B}=\frac{1-e^{-a\Delta}}{a},\qquad
+K_m=\bar{C}\bar{A}^m\bar{B}=\frac{1-e^{-a\Delta}}{a}\,e^{-a\Delta\,m}.
+\end{equation}
+The discrete half-life (steps until a spike's effect halves) is
+\begin{equation}
+m_{1/2}=\frac{\ln 2}{a\Delta}.
+\end{equation}
+
+\incfig{fig03_discretization.png}{%
+\textbf{Figure: continuous fade vs discrete samples.}
+The smooth curve is continuous exponential memory.
+Stem markers are what a ZOH discretization ``sees'' at token times $0,\Delta,2\Delta,\ldots$.
+Discretization does not invent a new theory of memory; it samples the continuous theory at the rate tokens arrive.}
+
+\incfig{fig13_halflife.png}{%
+\textbf{Figure: half-life heatmap.}
+Color shows $m_{1/2}=\ln 2/(a\Delta)$ for the scalar leaky integrator.
+Moving right (larger decay rate $a$) or up (larger step $\Delta$) shortens memory in token units.
+Mamba's selection can be read as moving around this heatmap \emph{per token}: important tokens may use a different effective $\Delta$ than noise tokens.}
+
+\paragraph{Diagonal ZOH (implementation form).}
+If $A=\mathrm{diag}(\lambda_i)$, componentwise
+\begin{equation}
+\bar{A}_{ii}=e^{\lambda_i\Delta},\qquad
+\bar{B}_i=
+\begin{cases}
+\dfrac{e^{\lambda_i\Delta}-1}{\lambda_i}B_i & \lambda_i\neq 0,\\[6pt]
+\Delta B_i & \lambda_i=0.
+\end{cases}
+\end{equation}
+In floating point use \texttt{expm1} for stability near zero.
+
+\subsection{Bilinear / Tustin method}
+
+The bilinear transform maps continuous Laplace $s$ to discrete $z$ by
+\begin{equation}
+s=\frac{2}{\Delta}\frac{1-z^{-1}}{1+z^{-1}}.
+\end{equation}
+Applying this idea to the state equation yields the common form used in S4 literature:
+\begin{equation}
+\bar{A}=\Big(I-\frac{\Delta}{2}A\Big)^{-1}\Big(I+\frac{\Delta}{2}A\Big),\qquad
+\bar{B}=\Big(I-\frac{\Delta}{2}A\Big)^{-1}\Delta B.
+\label{eq:bilinear}
+\end{equation}
+
+\paragraph{Trapezoid derivation sketch.}
+Approximate
+\begin{equation}
+\frac{x_k-x_{k-1}}{\Delta}
+\approx A\frac{x_k+x_{k-1}}{2}+B\tilde{u}_k
+\end{equation}
+and rearrange for $x_k$ in terms of $x_{k-1}$.
+You solve a linear system of size $N$ instead of computing a matrix exponential series.
+Stability of continuous poles is mapped in a controlled way under the bilinear map (no aliasing of the entire left half-plane into unstable discrete poles the way some crude maps can).
+
+\subsection{What $\Delta$ means in a deep network}
+
+Large $\Delta$: each token is a ``big moment''; the discrete map moves state harder; old content is easier to overwrite.
+Small $\Delta$: gentle updates; the notebook is protected.
+Classical S4 treats $\Delta$ as a parameter (possibly learned) but \textbf{not} a function of the current token.
+Mamba's central modeling idea is $\Delta_k=\Delta(u_k)$.
+
+%======================================================================
+\section{Unrolling: recurrence, convolution, FFT}
+%======================================================================
+
+\subsection{Unrolling the recurrence}
+
+Assume $x_{-1}=0$. Iterate \eqref{eq:disc}:
+\begin{align}
+x_0&=\bar{B}u_0,\\
+x_1&=\bar{A}\bar{B}u_0+\bar{B}u_1,\\
+x_k&=\sum_{j=0}^{k}\bar{A}^{k-j}\bar{B}u_j.
+\end{align}
+Reading with $\bar{C}$ (and omitting $D$ for a moment),
+\begin{equation}
+y_k=\sum_{j=0}^{k}K_{k-j}u_j,\qquad
+K_m=\bar{C}\,\bar{A}^{m}\,\bar{B}.
+\label{eq:Km}
+\end{equation}
+So the length-$L$ kernel is the list
+\begin{equation}
+K=\big(\bar{C}\bar{B},\;\bar{C}\bar{A}\bar{B},\;\ldots,\;\bar{C}\bar{A}^{L-1}\bar{B}\big),
+\end{equation}
+and $y=K*u$ (causal convolution).
+
+\begin{notebox}
+\textbf{Two faces of one LTI model.}
+\textbf{Recurrent face:} update $x$ each step --- natural for autoregressive decode ($O(1)$ state).
+\textbf{Convolutional face:} build $K$ once and filter the whole sequence --- natural for parallel training.
+\end{notebox}
+
+\subsection{Diagonal kernels as multi-scale memory}
+
+If $\bar{A}=\mathrm{diag}(\bar\lambda_i)$, then
+\begin{equation}
+K_m=\sum_{i=1}^{N} C_i \bar\lambda_i^{m} \bar B_i.
+\end{equation}
+Each term is a geometric mode: a pure exponential decay (or oscillation if complex) on the lag axis.
+Summing modes with different rates builds a kernel that remembers some things briefly and some things for a long time.
+
+\incfig{fig04_multiscale_kernel.png}{%
+\textbf{Figure: sum of geometric modes.}
+Thin curves are individual modes (fast and slow).
+The thick black curve is their weighted sum --- the full kernel $K_m$.
+This is the mental picture for S4D/diagonal SSMs: memory is a bank of faders, not a mysterious black box.}
+
+\subsection{FFT training for LTI models}
+
+Naive convolution is $O(L^2)$.
+The convolution theorem says that after discrete Fourier transform,
+\begin{equation}
+K*u=\mathcal{F}^{-1}\big(\mathcal{F}(K)\odot\mathcal{F}(u)\big),
+\end{equation}
+provided we zero-pad to length at least $2L-1$ (or the next power of two) so that circular convolution agrees with linear convolution on the first $L$ outputs.
+Cost becomes $O(L\log L)$.
+
+\paragraph{Generating-function view (bridge to S4 papers).}
+\begin{equation}
+\hat{K}(z)=\sum_{m=0}^{L-1}K_m z^m
+=\bar{C}(I-z\bar{A})^{-1}\bar{B}
+\end{equation}
+(up to endpoint conventions).
+Evaluating $\hat{K}$ at roots of unity and inverse-FFT-ing is another way to apply the filter.
+When $\bar{A}$ is structured (diagonal or DPLR), $(I-z\bar{A})^{-1}$ becomes cheap, leading to Cauchy-kernel algorithms in classical S4.
+
+\incfig{fig05_scan_vs_fft.png}{%
+\textbf{Figure: the LTI identity in numbers.}
+Top: outputs of a recurrent scan and of FFT-based convolution with the analytic kernel, for a random diagonal SSM and random input (first 80 steps shown).
+Bottom: absolute difference on a log scale --- only floating-point noise.
+If your educational code does not reproduce this near-zero error, a bug exists in discretization, kernel construction, or padding.
+This identity is the mathematical heart of classical SSM training.}
+
+\begin{warnbox}
+\textbf{Hard boundary.}
+FFT training requires a \emph{single fixed} kernel $K$ for the whole sequence.
+If $\bar{A}_k$ and $\bar{B}_k$ change with $k$ (Mamba selection), there is no global $K$, and this section's training path does not apply.
+\end{warnbox}
+
+%======================================================================
+\section{HiPPO --- principled memory initialization}
+%======================================================================
+
+Random $A$ matrices usually implement either short memory or unstable dynamics.
+\textbf{HiPPO} (High-order Polynomial Projection Operators; Gu et al., NeurIPS 2020) asks a precise question: what linear ODE makes the state $x(t)$ track the coefficients of an optimal online projection of the \emph{history} of $u$ onto a polynomial basis?
+
+The answer is a specific family of matrices $A$ (and input vectors $B$).
+Low-order coefficients store coarse long-term trends; higher-order coefficients store fine recent detail.
+That is multi-scale compression with a theorem behind it, not only a heuristic.
+
+One common construction (HiPPO-LegT; sign conventions vary slightly by paper/code) is
+\begin{equation}
+A_{nk}=
+\begin{cases}
+-\sqrt{(2n+1)(2k+1)} & n>k,\\
+-(n+1) & n=k,\\
+0 & n<k.
+\end{cases}
+\end{equation}
+
+\incfig{fig11_hippo_eigs.png}{%
+\textbf{Figure: HiPPO spectrum.}
+Eigenvalues of a $32\times 32$ HiPPO-LegT matrix, plotted in the complex plane.
+All real parts are negative (left half-plane): the continuous system is stable.
+The spread of real parts is exactly the multi-scale lifetime structure: some modes die fast, some slowly.
+When you initialize an SSM from HiPPO, you are planting this spectrum (or a structured cousin of it) into the network before learning begins.}
+
+\textbf{Paper-level finding.}
+HiPPO showed large gains on long memorization tasks relative to naive recurrent baselines, establishing that \emph{memory quality is largely a structure/initialization problem on $A$}.
+
+%======================================================================
+\section{Structured SSMs (S4 family) --- making kernels computable}
+%======================================================================
+
+\subsection{Why structure?}
+
+Even a beautiful HiPPO $A$ is dense.
+Forming powers $\bar{A}^m$ or evaluating generating functions costs too much and can be numerically unstable for large $N$ and $L$.
+S4 (Gu, Goel, R\'{e}, ICLR 2022) forces a structure that keeps expressivity while making $\hat{K}(z)$ evaluable quickly.
+
+\subsection{Diagonal SSMs (S4D)}
+
+Set $A=\mathrm{diag}(\lambda_i)$ (often complex) with careful initialization (HiPPO eigenvalues or S4D-Lin/Inv recipes).
+Then $K_m=\sum_i C_i\bar\lambda_i^m\bar B_i$ as above.
+\textbf{Finding:} diagonal models capture most practical S4 gains with vastly simpler code.
+This is what you should implement first, and it is the substrate under many selective models.
+
+\subsection{DPLR and Woodbury (classical S4)}
+
+HiPPO-class matrices can be written, after unitary transform, as diagonal plus low rank:
+\begin{equation}
+A=\Lambda-PQ^\ast.
+\end{equation}
+The Woodbury identity says that if you know $M^{-1}$ and you add a low-rank bump $UV^\ast$,
+\begin{equation}
+(M+UV^\ast)^{-1}
+=M^{-1}-M^{-1}U\big(I+V^\ast M^{-1}U\big)^{-1}V^\ast M^{-1}.
+\end{equation}
+Applied to resolvents $(zI-A)^{-1}$, DPLR systems reduce to diagonal resolvents plus a thin correction.
+Those diagonal pieces produce \textbf{Cauchy kernels} of the form $1/(\omega_j-\zeta_i)$, for which stable fast algorithms exist.
+That pipeline is why S4 could claim near-linear kernel computation with HiPPO-level memory theory.
+
+\paragraph{S4 layer as a training story.}
+For each channel: parameters $(A,B,C,\Delta,D)$ $\to$ discretize $\to$ build or evaluate $K$ $\to$ $y=\mathrm{FFTConv}(K,u)+Du$ $\to$ nonlinear channel mixing $\to$ stack depth.
+At inference: drop the FFT and run the recurrence with stored state.
+
+\textbf{S4 paper finding.}
+Strong Long Range Arena results at sequence lengths where contemporary Transformers struggled, putting SSMs on the deep learning map.
+
+\subsection{H3 and Hyena --- the missing multiplicative piece}
+
+H3 (``Hungry Hungry Hippos'') and Hyena-style architectures showed that pure linear filters are not enough for language: you also need \textbf{data-controlled multiplicative interactions} (gating) stacked with long convolutions.
+This foreshadows Mamba, which moves content dependence into the SSM parameters themselves rather than only into external gates (Mamba still uses gates too).
+
+%======================================================================
+\section{Mamba --- selective state spaces}
+%======================================================================
+
+\subsection{Where LTI fails}
+
+Consider a stream of noise tokens, a rare marker, then values you must copy later.
+A fixed kernel $K$ applies the same lag weights regardless of content: it cannot open a register only when the marker appears.
+Transformers can content-address; pure S4 cannot as flexibly.
+Language is full of such content-dependent memory demands.
+
+\subsection{Selection mechanism}
+
+Mamba (Gu \& Dao, 2023) sets
+\begin{equation}
+\begin{aligned}
+\Delta_k&=\mathrm{softplus}(W_\Delta u_k+b),\\
+B_k&=W_B u_k,\\
+C_k&=W_C u_k,
+\end{aligned}
+\label{eq:select}
+\end{equation}
+then discretizes \emph{per step} to $\bar{A}_k,\bar{B}_k$ and runs the time-varying recurrence
+\begin{equation}
+x_k=\bar{A}_k x_{k-1}+\bar{B}_k u_k,\qquad
+y_k=C_k x_k.
+\label{eq:tv}
+\end{equation}
+$A$ itself usually remains constrained for stability, e.g.\ a negative diagonal
+\begin{equation}
+A=-\exp(A_{\log})\quad\text{(elementwise)}.
+\end{equation}
+
+\paragraph{Reading selection as policy.}
+\begin{itemize}[leftmargin=*]
+  \item Large $\Delta_k$: aggressive update; $\bar{A}_k$ can shrink toward 0 along modes $\Rightarrow$ forget / reset.
+  \item Small $\Delta_k$: $\bar{A}_k\approx I+\Delta_k A\approx I$ $\Rightarrow$ hold state.
+  \item $B_k$: which state directions to write.
+  \item $C_k$: which directions to read now.
+\end{itemize}
+
+For diagonal ZOH with $\lambda_i<0$,
+\begin{equation}
+\bar{A}_{k,ii}=e^{\lambda_i\Delta_k}\in(0,1).
+\end{equation}
+As $\Delta_k\to\infty$, $\bar{A}_{k,ii}\to 0$ (wipe).
+As $\Delta_k\to 0$, $\bar{A}_{k,ii}\to 1$ (preserve).
+That is selection as linear algebra.
+
+\incfig{fig06_selective_vs_lti.png}{%
+\textbf{Figure: LTI vs selective on spikes-in-noise (toy).}
+Top: input with three large spikes in Gaussian noise.
+Middle: fixed-$\Delta$ LTI diagonal SSM --- spikes are smoothed; noise continually pollutes the same filter.
+Bottom: $\Delta$ enlarged when $|u|$ is large --- the output reacts sharply at spikes and stays calmer on noise.
+This is a cartoon of why selection helps ``ignore fillers, keep events,'' not a full language benchmark.}
+
+\subsection{Parallel scan algebra}
+
+Identify step $k$ with the affine map $x\mapsto \bar{A}_k x+b_k$, $b_k=\bar{B}_k u_k$.
+Composition of two maps (diagonal case elementwise) is
+\begin{equation}
+(\bar{A}_2,b_2)\otimes(\bar{A}_1,b_1)
+=(\bar{A}_2\odot\bar{A}_1,\ \bar{A}_2\odot b_1+b_2).
+\label{eq:monoid}
+\end{equation}
+This binary operator is associative with identity $(1,0)$.
+Therefore the Blelloch parallel prefix algorithm computes all prefix maps in $O(\log L)$ parallel depth and $O(L)$ work --- exact, not approximate.
+
+\incfig{fig10_parallel_scan.png}{%
+\textbf{Figure: scan as a tree.}
+Leaves $P_1,\ldots,P_8$ are per-step maps.
+Internal nodes combine children with $\otimes$ from \eqref{eq:monoid}.
+Because $\otimes$ is associative, any parenthesization is valid, so the tree can run in parallel across the sequence.
+Depth scales like $\log L$; total combine work scales like $L$.}
+
+\subsection{Mamba block architecture}
+
+\incfig{fig12_mamba_block.png}{%
+\textbf{Figure: one Mamba block.}
+Left to right: expand channels; local depthwise Conv1d (short syntax); selective SSM (long content-aware memory); SiLU gate branch; project back and add residual.
+A language model stacks many such blocks.
+There is no growing KV-cache: only a fixed recurrent state plus a tiny conv state.}
+
+\subsection{Mamba paper findings (what was actually claimed/shown)}
+
+\begin{itemize}[leftmargin=*]
+  \item Language modeling on The Pile competitive with Transformer baselines in the 130M--2.8B range.
+  \item Strong behavior as sequence length grows; large inference throughput from $O(1)$ state updates.
+  \item Synthetic tasks (selective copy, induction-style) where LTI SSMs fail.
+  \item Beyond text: audio and genomics experiments demonstrating modality generality.
+\end{itemize}
+
+\subsection{Mamba-2 and state space duality (SSD)}
+
+Dao \& Gu (2024) show selective SSMs dualize to structured (semiseparable) matrix multiplies related to linear attention.
+Practically: chunk the sequence, do heavy work as batched GEMMs (tensor cores), pass a light state across chunks.
+Results: larger practical $N$ (e.g.\ 64--128 class), faster training than pure Mamba-1 scans, cleaner multi-GPU projection layouts.
+Minimal SSD educational cores shrink to tens of lines of PyTorch; production still uses highly optimized kernels.
+
+%======================================================================
+\section{GPU theory --- why ``linear FLOPs'' is not enough}
+%======================================================================
+
+\subsection{Memory hierarchy}
+
+\incfig{fig09_gpu_hierarchy.png}{%
+\textbf{Figure: GPU memory stack.}
+Registers and SRAM (shared memory) are tiny but extremely fast.
+HBM (the big GPU RAM) is huge but comparatively slow and bandwidth-limited.
+If every step of a scan reads/writes full activations and states through HBM, you become bandwidth-bound and wall-clock collapses even when big-$O$ FLOPs look linear.
+Fused Mamba kernels keep the hot state in SRAM, stream sequence tiles, and recompute intermediates on the backward pass (FlashAttention philosophy).}
+
+\paragraph{Roofline reminder.}
+Arithmetic intensity $=\mathrm{FLOPs}/\mathrm{bytes\,moved\,from\,HBM}$.
+Low intensity $\Rightarrow$ bandwidth-bound (common).
+High intensity $\Rightarrow$ compute-bound (large tensor-core GEMMs).
+Naive PyTorch loops over $L$ launch tiny ops and thrash HBM: educational, not production.
+
+\paragraph{IO sketch.}
+For batch $B$, length $L$, width $D$, state $N$, a fused implementation aims for HBM traffic on the order of reading inputs and writing outputs $O(BLD)$ (plus modest factors), \textbf{not} materializing full state histories $O(BLDN)$ every layer.
+
+\subsection{Why Mamba-2 chases tensor cores}
+
+Tensor cores accelerate dense matrix multiplies far more than ad-hoc scan loops.
+SSD chunking turns much of the selective work into GEMMs of shape involving chunk length $C$ (often 256) and state size $N$.
+That is why larger $N$ becomes attractive: it becomes a matmul dimension, not only a slower sequential burden.
+
+\subsection{Numerics that show up in real training}
+
+\begin{itemize}[leftmargin=*]
+  \item Parameterize $A$ to stay stable (negative real parts).
+  \item Softplus $+$ clamp/floor on $\Delta$.
+  \item Prefer FP32 master weights even if compute is BF16/FP16.
+  \item Expect tiny differences between parallel scan and sequential reference under mixed precision; test with tolerances.
+  \item Complex diagonal forms need careful real/imag packing.
+\end{itemize}
+
+%======================================================================
+\section{Multi-channel layout and stacking into LMs}
+%======================================================================
+
+Token embeddings are vectors $u_k\in\mathbb{R}^{d}$.
+Standard design: run SISO SSMs \textbf{depthwise} on each channel (or on expanded channels), each with state size $N$, then mix channels with linear layers and nonlinearities --- the same pattern as depthwise separable convolution.
+
+A pure Mamba LM looks roughly like:
+\begin{enumerate}[leftmargin=*]
+  \item token embedding (+ optional positionless design; recurrence carries order);
+  \item stack of $L_{\mathrm{ayers}}$ residual Mamba blocks;
+  \item RMSNorm / LayerNorm variants as in modern LMs;
+  \item untied or tied LM head to vocabulary logits.
+\end{enumerate}
+Typical published sizes (original Mamba checkpoints) follow GPT-3-like width/depth tables from 130M to 2.8B trained on The Pile, plus larger community and industry hybrids later.
+
+%======================================================================
+\section{Code: educational implementations}
+%======================================================================
+
+\subsection{LTI path --- bilinear, ZOH-diag, kernel, scan, FFT}
+
+\begin{lstlisting}
+import numpy as np
+
+def discretize_bilinear(A, B, C, D, delta):
+    I = np.eye(A.shape[0])
+    Bl = np.linalg.inv(I - 0.5 * delta * A)
+    Ab = Bl @ (I + 0.5 * delta * A)
+    Bb = Bl @ (delta * B)
+    return Ab, Bb, C, D
+
+def discretize_zoh_diag(lam, B, delta):
+    """lam, B: shape (N,)"""
+    Abar = np.exp(lam * delta)
+    Bbar = np.where(
+        np.abs(lam) < 1e-8,
+        B * delta,
+        B * (np.expm1(lam * delta) / lam),
+    )
+    return Abar, Bbar
+
+def ssm_kernel_diag(Abar, Bbar, C, D, L):
+    K = np.zeros(L)
+    v = Bbar.copy()
+    for m in range(L):
+        K[m] = C @ v
+        v = Abar * v
+    K[0] += D
+    return K
+
+def ssm_scan_diag(Abar, Bbar, C, D, u):
+    x = np.zeros_like(Bbar)
+    ys = []
+    for uk in u:
+        x = Abar * x + Bbar * uk
+        ys.append(C @ x + D * uk)
+    return np.asarray(ys)
+
+def fft_conv_causal(K, u):
+    L = len(u)
+    n = 1
+    while n < 2 * L:
+        n *= 2
+    y = np.fft.irfft(np.fft.rfft(K, n) * np.fft.rfft(u, n), n)
+    return y[:L]
+
+# Sanity: y_scan and fft_conv_causal(K,u) must match for LTI systems
+\end{lstlisting}
+
+\subsection{Selective scan (clarity over speed)}
+
+\begin{lstlisting}
+import torch
+
+def selective_scan_edu(A_log, B, C, delta, u):
+    """
+    A_log: (N,)  -> lam = -exp(A_log)
+    B,C: (L,N); delta:(L,); u:(L,)
+    """
+    lam = -torch.exp(A_log)
+    x = torch.zeros_like(lam)
+    ys = []
+    for k in range(u.shape[0]):
+        Abar = torch.exp(lam * delta[k])
+        Bbar = torch.where(
+            lam.abs() < 1e-6,
+            B[k] * delta[k],
+            B[k] * torch.expm1(lam * delta[k]) / lam,
+        ) * u[k]
+        x = Abar * x + Bbar
+        ys.append((C[k] * x).sum())
+    return torch.stack(ys)
+\end{lstlisting}
+
+\begin{notebox}
+This loop is for learning.
+Real training/serving uses fused CUDA/Triton kernels from \texttt{mamba-ssm} / vendor stacks.
+If you benchmark the loop against FlashAttention Transformers, you are not measuring Mamba --- you are measuring Python.
+\end{notebox}
+
+\subsection{Production libraries}
+
+\begin{lstlisting}
+# Official block with fused kernels (CUDA)
+from mamba_ssm import Mamba, Mamba2
+block = Mamba(d_model=768, d_state=16, d_conv=4, expand=2).cuda()
+y = block(x)  # x: (batch, length, d_model)
+
+# Hugging Face causal LM
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "state-spaces/mamba-130m-hf"
+tok = AutoTokenizer.from_pretrained(name)
+lm = AutoModelForCausalLM.from_pretrained(name)
+ids = tok("State space models are", return_tensors="pt")
+out = lm.generate(**ids, max_new_tokens=64)
+print(tok.decode(out[0], skip_special_tokens=True))
+\end{lstlisting}
+
+\paragraph{Meaning of hyperparameters.}
+\texttt{d\_model}: channel width $d$.
+\texttt{d\_state}: state size $N$ (notebook dimension).
+\texttt{d\_conv}: local conv kernel width.
+\texttt{expand}: inner expansion factor $e$ (width becomes $e\cdot d$ inside the block).
+
+\paragraph{Fine-tuning note.}
+LoRA module names differ from Transformers: often \texttt{in\_proj}, \texttt{x\_proj}, \texttt{out\_proj}, embeddings --- not \texttt{q\_proj}/\texttt{v\_proj}.
+
+%======================================================================
+\section{Industry use cases and real-life implementation}
+%======================================================================
+
+\incfig{fig14_industry_pipeline.png}{%
+\textbf{Figure: deployment sketch.}
+Long documents or repositories enter a Mamba or hybrid model.
+Prefill encodes the prompt into states (and any attention caches for hybrid layers).
+Decode steps update a compact state and emit tokens to an API or IDE.
+The economic win is concurrent long sessions without multi-gigabyte KV growth per user.}
+
+\subsection{Where SSMs and hybrids actually appear}
+
+\begin{center}
+\begin{tabular}{@{}p{3.2cm}p{2.2cm}p{7.2cm}@{}}
+\toprule
+\textbf{System / line} & \textbf{Org} & \textbf{How SSMs are used} \\
+\midrule
+\texttt{state-spaces/mamba-*} & open research & Pure Mamba LMs for baselines, long-context experiments, distillation starts \\
+Codestral Mamba & Mistral & Code generation with Mamba-2 lineage; long repo context; fast completion \\
+Jamba / Jamba 1.5 & AI21 & Hybrid Mamba+Transformer (+MoE): enterprise long documents on leaner GPU budgets \\
+Granite hybrid lines & IBM & Hybrid efficiency for regulated enterprise serving (watsonx-class stacks) \\
+Nemotron-H-class & NVIDIA & High-throughput hybrid inference recipes \\
+Vim / VMamba / U-Mamba & research+apps & Vision and medical imaging with spatial scans \\
+Audio / genomics SSMs & research+bio & Long waveforms and base-pair sequences \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{A realistic serving story (hybrid LM)}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Model choice.} If the product needs strong ICL and exact quote-from-context, pick a hybrid (most layers SSM, some attention), not pure Mamba.
+  \item \textbf{Kernels.} Install GPU kernels matching your stack (\texttt{mamba-ssm}, TensorRT-LLM, vLLM support matrix, vendor NIM). Without them, latency goals fail.
+  \item \textbf{Prefill.} Encode the prompt. SSM layers advance state; attention layers build KV only for those layers (much smaller than full-Transformer cache if attention is sparse in depth).
+  \item \textbf{Decode.} For each new token: update SSM states $O(N)$ per channel group; update attention KV only for attention layers; sample next token.
+  \item \textbf{Batching.} Continuous batching still applies; memory headroom from flat SSM state often allows higher concurrency.
+  \item \textbf{Quantization.} Weight-only 8/4-bit common; validate quality --- selective dynamics can be numerically sensitive.
+  \item \textbf{Observability.} Track tokens/s, GB/s, TTFT, TBT, and quality probes (needle-in-haystack, copy, ICL suite).
+\end{enumerate}
+
+\subsection{When to choose what (product checklist)}
+
+\textbf{Lean SSM / hybrid} when p95 context is long, concurrency is high, decode VRAM dominates cost, or the modality is a long signal (audio, DNA, logs).
+
+\textbf{Transformer-first} when short turns dominate, peak few-shot tool-format quality is the KPI, or your entire MLOps toolchain assumes Llama-class models only.
+
+\subsection{Training recipe notes used in practice}
+
+\begin{itemize}[leftmargin=*]
+  \item Initialize $A$ stable (HiPPO eigenvalues / negative diagonal recipes from papers).
+  \item Bound $\Delta$; use softplus.
+  \item Keep FP32 parameters when possible.
+  \item Use fused kernels from day one for any serious run.
+  \item Gradient checkpointing for long $L$.
+  \item Copy published width/depth/state tables before inventing new ones.
+  \item For hybrids, tune SSM:Attn ratio on \emph{your} retrieval/ICL probes, not only on perplexity.
+\end{itemize}
+
+%======================================================================
+\section{Research timeline recap (findings in one place)}
+%======================================================================
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{HiPPO (2020)} --- polynomial projection theory for $A$; memory is a structure problem.
+  \item \textbf{LSSL (2021)} --- linear state-space layers unify recurrent/conv/continuous views; compute still hard.
+  \item \textbf{S4 (2022)} --- DPLR + Woodbury + Cauchy + FFT; LRA breakthrough.
+  \item \textbf{S4D/DSS (2022)} --- diagonal is enough for most gains.
+  \item \textbf{H3/Hyena (2023 era)} --- need multiplicative content interactions for language.
+  \item \textbf{Mamba (2023)} --- selection + fused scan; competitive LMs; modality breadth.
+  \item \textbf{Mamba-2/SSD (2024)} --- duality with structured attention; tensor-core algorithms; larger $N$.
+  \item \textbf{Hybrids (2024--)} --- production Pareto frontier for general LLMs often mixes SSM + attention.
+\end{enumerate}
+
+%======================================================================
+\section{Limits and open problems}
+%======================================================================
+
+\begin{itemize}[leftmargin=*]
+  \item Associative recall / exact far copy still favor attention.
+  \item Some ICL and rigid format-following behaviors are stronger in Transformers or hybrids.
+  \item Best kernels remain most mature on NVIDIA CUDA; portability improving via compilers/SSD structure.
+  \item Quantization and extreme selection can interact badly with stability.
+  \item Ecosystem (serving knobs, speculative decoding maturity, adapter zoos) still denser for Transformers.
+\end{itemize}
+
+\begin{notebox}
+Correct slogan: SSMs rewrite the \textbf{cost curve of long state}, often mixed with attention.
+Incorrect slogan: SSMs already replace Transformers everywhere.
+\end{notebox}
+
+%======================================================================
+\section{Study plan and exercises}
+%======================================================================
+
+\paragraph{Ten-day path.}
+\begin{enumerate}[leftmargin=*]
+  \item Explain \eqref{eq:cont} and $k(t)$ out loud.
+  \item Derive \eqref{eq:varpar} without notes.
+  \item Scalar ZOH half-life; reproduce Figure~13 intuition.
+  \item Implement diagonal LTI; prove scan $\approx$ FFT (Figure~5).
+  \item Plot multi-scale kernels (Figure~4).
+  \item Read HiPPO abstract + inspect eigenvalues (Figure~11).
+  \item Read S4 abstract; explain DPLR in one paragraph.
+  \item Educational selective scan; reproduce Figure~6 spirit.
+  \item Explain GPU hierarchy and why fusion exists (Figure~9).
+  \item Run HF Mamba generate; write a one-page ship/no-ship memo for your use case.
+\end{enumerate}
+
+\paragraph{Exercises.}
+\begin{enumerate}[leftmargin=*]
+  \item Derive $x(t)$ for $A=-1$, $B=1$, $u\equiv 1$, $x(0)=0$. Interpret each term.
+  \item Show unrolling yields $K_m=\bar C\bar A^m\bar B$.
+  \item Prove associativity of $\otimes$ in \eqref{eq:monoid} for diagonal maps.
+  \item Build a selective-copy dataset; compare LTI vs selective accuracy.
+  \item Estimate KV GB vs SSM state GB for your favorite open model shape at $L=8$k, $128$k.
+  \item Profile (even roughly) a pure PyTorch selective loop vs a fused kernel if you have CUDA.
+\end{enumerate}
+
+%======================================================================
+\section{Symbol glossary}
+%======================================================================
+
+\begin{description}[style=nextline,leftmargin=2.6cm,font=\normalfont\bfseries]
+  \item[$L$] Sequence length.
+  \item[$N$] State size (notebook dimension).
+  \item[$d$ / $D$] Model channel width.
+  \item[$A,B,C,D$] Continuous SSM parameters.
+  \item[$\Delta$] Discretization step / timescale (input-dependent in Mamba).
+  \item[$\bar A,\bar B$] Discrete transition and input maps.
+  \item[$K_m$] Impulse response at lag $m$ (LTI).
+  \item[$x_k$] State after processing token $k$.
+  \item[HBM] High-bandwidth GPU main memory.
+  \item[SRAM] Fast on-chip scratchpad / shared memory.
+  \item[DPLR] Diagonal Plus Low-Rank structure.
+  \item[SSD] State Space Duality (Mamba-2).
+  \item[KV-cache] Cached Transformer keys/values at decode.
+\end{description}
+
+%======================================================================
+\section{References}
+%======================================================================
+
+\begin{enumerate}[leftmargin=*]
+  \item Gu et al., \emph{HiPPO}, NeurIPS 2020. arXiv:2008.07669
+  \item Gu et al., \emph{LSSL}, NeurIPS 2021. arXiv:2110.13985
+  \item Gu, Goel, R\'{e}, \emph{S4}, ICLR 2022. arXiv:2111.00396
+  \item Gu et al., diagonal / S4D follow-ups, 2022
+  \item Fu et al., H3; Poli et al., Hyena, 2023 era
+  \item Gu \& Dao, \emph{Mamba}, 2023. arXiv:2312.00752
+  \item Dao \& Gu, \emph{Mamba-2 / SSD}, 2024. arXiv:2405.21060
+  \item AI21 Jamba hybrid reports; IBM Granite hybrid announcements; Mistral Codestral Mamba
+  \item Vision Mamba / VMamba / medical U-Mamba literature, 2024--
+  \item Annotated S4: \url{https://srush.github.io/annotated-s4/}
+  \item Mamba code: \url{https://github.com/state-spaces/mamba}
+  \item HF Mamba: \url{https://huggingface.co/docs/transformers/model_doc/mamba}
+  \item Lecture: \url{https://www.youtube.com/watch?v=A7iAmVr0QE4}
+\end{enumerate}
+
+\begin{notebox}
+\textbf{Closing picture.}
+A Transformer re-reads the whole room.
+An SSM carries a pocket notebook whose fade laws began as continuous-time control theory, became computable through S4 structure, became content-aware through Mamba selection, and became fast on GPUs only when engineers respected HBM vs SRAM.
+Industry often keeps a few attention layers for the moments when a notebook must become a lookup table again.
+
+If you can explain each figure in this document in two sentences, you understand the field well enough to read the papers without drowning.
+\end{notebox}
+
+\end{document}

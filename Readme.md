@@ -51,8 +51,10 @@ If you are new to the concept of **World Models**, **State Space Models**, or **
 | 4 | The State (SSMs: HiPPO, S4, Mamba) | **Done** | `State_Space_Models/SSM_S4_Mamba_HiPPO.ipynb` |
 | 5 | Emergence (fractals, attractors, chaos) | **Done** | `Calculus & Dynamics/chaos/**` |
 | 6 | Reasoning (MCTS, look-ahead, interventions) | **Done** | `Reasoning_and_Planning/MCTS_Lookahead_Planning.ipynb` |
-| 7 | Embodiment (V-JEPA, Dreamer-style world models, video) | Planned | — |
-| 8 | Meta-Learning (MAML, hypothesis generation) | Planned | — |
+| 7 | Embodiment / World Models (Dreamer-style + JEPA) | **Done** | `World_Models/Dreamer_JEPA_World_Models.ipynb` |
+| 8 | Meta-Learning (MAML, Reptile, few-shot adaptation) | **Done** | `Meta_Learning/MAML_and_Fast_Adaptation.ipynb` |
+
+**Study path:** start with `LEARNING_GUIDE.md` (plain-language tour of every phase), then run notebooks in order.
 
 ---
 
@@ -78,7 +80,12 @@ Causal-Dynamical-AI/
 │   └── SSM_S4_Mamba_HiPPO.ipynb
 ├── Reasoning_and_Planning/              # Phase 6
 │   └── MCTS_Lookahead_Planning.ipynb
+├── World_Models/                        # Phase 7
+│   └── Dreamer_JEPA_World_Models.ipynb
+├── Meta_Learning/                       # Phase 8
+│   └── MAML_and_Fast_Adaptation.ipynb
 ├── scripts/                             # notebook builders / executors
+├── LEARNING_GUIDE.md                    # plain-language study path
 ├── requirements.txt
 └── README.md
 ```
@@ -97,6 +104,8 @@ Causal-Dynamical-AI/
 8. **Inference & Causality** → BP, Gibbs/MH, $P(Y\mid do(X))$ vs $P(Y\mid X)$
 9. **SSM / S4 / Mamba** → scalable continuous-time memory
 10. **MCTS Planning** → look-ahead using a model as an interventional simulator
+11. **World Models** → learn the simulator; MPC in imagination; JEPA latents
+12. **MAML / Reptile** → fast adaptation when the task/world shifts
 
 ---
 

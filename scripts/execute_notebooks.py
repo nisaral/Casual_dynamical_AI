@@ -8,6 +8,8 @@ NOTEBOOKS = [
     ROOT / "Probabilistic_Graphs_and_State" / "Inference_Algorithms_and_Causality.ipynb",
     ROOT / "State_Space_Models" / "SSM_S4_Mamba_HiPPO.ipynb",
     ROOT / "Reasoning_and_Planning" / "MCTS_Lookahead_Planning.ipynb",
+    ROOT / "World_Models" / "Dreamer_JEPA_World_Models.ipynb",
+    ROOT / "Meta_Learning" / "MAML_and_Fast_Adaptation.ipynb",
 ]
 
 
